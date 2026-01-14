@@ -130,7 +130,8 @@ def transcribe_file(model: WhisperModel, wav_path: str, language: str | None, be
 
     # tiny UX print
     if info and getattr(info, "language", None):
-        print(f"Language: {info.language} (prob={getattr(info, 'language_probability', 0):.2f})")
+        # print(f"Language: {info.language} (prob={getattr(info, 'language_probability', 0):.2f})")
+        pass
 
     return text
 
@@ -142,7 +143,7 @@ def main():
     load_dotenv()
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-    parser = argparse.ArgumentParser(description="Press Q to start recording, Q again to stop+transcribe+send.")
+    parser = argparse.ArgumentParser(description="Press Q to start recording, Q again to stop+queue for processing.")
     parser.add_argument("--model", default="tiny", help="tiny/base/small/medium/large-v3...")
     parser.add_argument("--compute_type", default="int8", help="int8 (best CPU), float16 (GPU), float32...")
     parser.add_argument("--language", default=None, help="en/hi/ur or leave empty for auto-detect")
@@ -162,20 +163,46 @@ def main():
     )
 
     quit_flag = threading.Event()
-    busy_flag = threading.Event()  # prevents spam keys during transcribe/post
+    wav_queue = queue.Queue()  # queue of WAV files to process
 
     def print_help():
         print("\nControls:")
-        print("  Q      → start/stop recording and transcribe+send to Discord")
+        print("  Q      → start/stop recording")
         print("  CTRL+C → force quit\n")
 
     print_help()
 
-    def on_press(key):
-        # ignore if we're busy transcribing/posting
-        if busy_flag.is_set():
-            return
+    # Background worker thread for transcription and Discord sending
+    def worker_loop():
+        while not quit_flag.is_set():
+            try:
+                wav = wav_queue.get(timeout=0.5)
+                if wav is None:  # poison pill to stop worker
+                    break
 
+                print("Transcribing...")
+                text = transcribe_file(model, wav, args.language, args.beam_size)
+
+                if not text:
+                    print("No speech detected. Not sending.\n")
+                else:
+                    # print(f"Transcript:")
+                    print(f"\"{text}\"\n")
+                    print("Sending to Discord...")
+                    try:
+                        post_to_discord(webhook_url, text)
+                        print("✅ Sent.\n")
+                    except Exception as e:
+                        print(f"❌ Discord send failed: {e}\n")
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"Worker error: {e}", file=sys.stderr)
+
+    worker_thread = threading.Thread(target=worker_loop, daemon=True)
+    worker_thread.start()
+
+    def on_press(key):
         try:
             # character keys
             if hasattr(key, "char") and key.char:
@@ -185,33 +212,16 @@ def main():
                     if not recorder.is_recording.is_set():
                         # Start recording
                         recorder.start()
-                        print("● Recording... (press Q again to stop) 💀‼‼ ")
+                        print("● Recording... (press Q again to stop)")
                     else:
-                        # Stop, transcribe, and send
-                        busy_flag.set()
+                        # Stop recording and queue for processing
                         print("Stopping...")
-
                         wav = recorder.stop_and_save(args.out)
                         if not wav:
                             print("No audio captured.")
-                            busy_flag.clear()
-                            return
-
-                        print("Transcribing...")
-                        text = transcribe_file(model, wav, args.language, args.beam_size)
-
-                        if not text:
-                            print("No speech detected. Not sending.\n")
                         else:
-                            print(f"\nTranscript:\n{text}\n")
-                            print("Sending to Discord...")
-                            try:
-                                post_to_discord(webhook_url, text)
-                                print("✅ Sent.\n")
-                            except Exception as e:
-                                print(f"❌ Discord send failed: {e}\n")
-
-                        busy_flag.clear()
+                            wav_queue.put(wav)
+                            # print("Queued for processing.")
         except Exception as e:
             print(f"Key handler error: {e}", file=sys.stderr)
 
@@ -219,6 +229,10 @@ def main():
     with keyboard.Listener(on_press=on_press) as listener:
         while not quit_flag.is_set():
             time.sleep(0.1)
+
+    # Signal worker to stop and wait for it
+    wav_queue.put(None)
+    worker_thread.join(timeout=5)
 
     print("Bye.")
 
