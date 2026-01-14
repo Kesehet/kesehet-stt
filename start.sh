@@ -1,0 +1,1 @@
+python app.py --model small --compute_type int8 --language en 

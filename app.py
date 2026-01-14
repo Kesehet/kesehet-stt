@@ -1,137 +1,226 @@
-import argparse
+import os
 import sys
+import time
 import queue
+import threading
+import argparse
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+import requests
+from dotenv import load_dotenv
+from pynput import keyboard
 from faster_whisper import WhisperModel
 
 
-def record_audio(outfile: str, samplerate: int, channels: int, device=None, dtype="float32"):
-    """
-    Records audio until the user hits ENTER.
-    Writes a WAV file to `outfile`.
-    """
-    print("\nPress ENTER to START recording...")
-    input()
-    print("Recording... press ENTER to STOP.\n")
+# -----------------------------
+# Discord
+# -----------------------------
+def post_to_discord(webhook_url: str, text: str):
+    if not webhook_url:
+        raise ValueError("DISCORD_WEBHOOK_URL is missing. Put it in your .env file.")
 
-    q = queue.Queue()
+    payload = {"content": text if text else "[No speech detected]"}
+    r = requests.post(webhook_url, json=payload, timeout=15)
+    r.raise_for_status()
 
-    def callback(indata, frames, time, status):
+
+# -----------------------------
+# Audio Recording
+# -----------------------------
+class Recorder:
+    def __init__(self, samplerate=16000, channels=1, device=None, dtype="float32"):
+        self.samplerate = samplerate
+        self.channels = channels
+        self.device = device
+        self.dtype = dtype
+
+        self._q = queue.Queue()
+        self._frames = []
+        self._stream = None
+
+        self.is_recording = threading.Event()
+
+    def _callback(self, indata, frames, time_info, status):
         if status:
             print(status, file=sys.stderr)
-        q.put(indata.copy())
+        # keep pushing chunks while recording
+        self._q.put(indata.copy())
 
-    stream = sd.InputStream(
-        samplerate=samplerate,
-        channels=channels,
-        device=device,
-        dtype=dtype,
-        callback=callback,
-    )
+    def start(self):
+        if self.is_recording.is_set():
+            return
 
-    frames = []
-    with stream:
-        # Wait for Enter key to stop
-        try:
-            while True:
-                if sys.stdin in select_inputs():
-                    _ = sys.stdin.readline()
-                    break
-                frames.append(q.get())
-        except KeyboardInterrupt:
-            print("\nStopped (KeyboardInterrupt).")
+        self._frames = []
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
 
-    audio = np.concatenate(frames, axis=0)
-    # Convert to mono if needed
-    if channels > 1:
-        audio = np.mean(audio, axis=1)
+        self._stream = sd.InputStream(
+            samplerate=self.samplerate,
+            channels=self.channels,
+            device=self.device,
+            dtype=self.dtype,
+            callback=self._callback,
+        )
+        self._stream.start()
+        self.is_recording.set()
 
-    sf.write(outfile, audio, samplerate)
-    print(f"Saved recording to: {outfile}")
-    return outfile
+        # collector thread to pull from queue -> frames
+        threading.Thread(target=self._collector_loop, daemon=True).start()
+
+    def _collector_loop(self):
+        while self.is_recording.is_set():
+            try:
+                chunk = self._q.get(timeout=0.2)
+                self._frames.append(chunk)
+            except queue.Empty:
+                pass
+
+    def stop_and_save(self, outfile: str) -> str:
+        if not self.is_recording.is_set():
+            return ""
+
+        self.is_recording.clear()
+        time.sleep(0.2)  # small buffer to flush last chunks
+
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+        if not self._frames:
+            return ""
+
+        audio = np.concatenate(self._frames, axis=0)
+
+        # mono
+        if self.channels > 1:
+            audio = np.mean(audio, axis=1)
+
+        sf.write(outfile, audio, self.samplerate)
+        return outfile
 
 
-def select_inputs():
-    """
-    Cross-platform-ish non-blocking stdin check.
-    Windows: uses msvcrt
-    Others: uses select
-    """
-    if sys.platform.startswith("win"):
-        import msvcrt
-        if msvcrt.kbhit():
-            # emulate "stdin is ready"
-            return [sys.stdin]
-        return []
-    else:
-        import select
-        r, _, _ = select.select([sys.stdin], [], [], 0)
-        return r
-
-
-def transcribe(model: WhisperModel, wav_path: str, language: str | None, beam_size: int):
+# -----------------------------
+# Whisper Transcription
+# -----------------------------
+def transcribe_file(model: WhisperModel, wav_path: str, language: str | None, beam_size: int) -> str:
     segments, info = model.transcribe(
         wav_path,
         language=language,
         beam_size=beam_size,
-        vad_filter=True,          # helps skip long silences
+        vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
     )
 
-    print("\n--- Transcription ---")
-    if info.language:
-        print(f"Detected/Used language: {info.language} (prob={info.language_probability:.2f})")
-
-    text_out = []
+    pieces = []
     for seg in segments:
-        line = seg.text.strip()
-        if line:
-            text_out.append(line)
+        t = seg.text.strip()
+        if t:
+            pieces.append(t)
 
-    final_text = " ".join(text_out).strip()
-    print(final_text if final_text else "[No speech detected]")
-    print("---------------------\n")
-    return final_text
+    text = " ".join(pieces).strip()
+
+    # tiny UX print
+    if info and getattr(info, "language", None):
+        print(f"Language: {info.language} (prob={getattr(info, 'language_probability', 0):.2f})")
+
+    return text
 
 
+# -----------------------------
+# Hotkey-driven CLI
+# -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Record from mic and transcribe using faster-whisper.")
-    parser.add_argument("--model", default="tiny", help="Model size: tiny, base, small, medium, large-v3, etc.")
-    parser.add_argument("--device", default=None, help="Input device index or name (see sounddevice query).")
-    parser.add_argument("--samplerate", type=int, default=16000, help="Sample rate (16000 is fine for Whisper).")
-    parser.add_argument("--channels", type=int, default=1, help="1=mono (recommended).")
-    parser.add_argument("--language", default=None, help="e.g. en, hi, ur (or leave empty for auto-detect).")
-    parser.add_argument("--compute_type", default="int8", help="int8 (fast/light CPU), float16 (GPU), float32, etc.")
-    parser.add_argument("--beam_size", type=int, default=3, help="Higher = more accurate, slower.")
-    parser.add_argument("--out", default="recording.wav", help="Output wav filename.")
+    load_dotenv()
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+    parser = argparse.ArgumentParser(description="Press Q to start recording, Q again to stop+transcribe+send.")
+    parser.add_argument("--model", default="tiny", help="tiny/base/small/medium/large-v3...")
+    parser.add_argument("--compute_type", default="int8", help="int8 (best CPU), float16 (GPU), float32...")
+    parser.add_argument("--language", default=None, help="en/hi/ur or leave empty for auto-detect")
+    parser.add_argument("--beam_size", type=int, default=3)
+    parser.add_argument("--samplerate", type=int, default=16000)
+    parser.add_argument("--channels", type=int, default=1)
+    parser.add_argument("--device", default=None, help="Input device index or name (optional)")
+    parser.add_argument("--out", default="recording.wav", help="WAV filename to write")
     args = parser.parse_args()
 
-    # Load whisper model
-    # device="cpu" keeps it lightweight; compute_type="int8" is usually the best for CPU speed/memory
-    print(f"Loading model '{args.model}' (device=cpu, compute_type={args.compute_type}) ...")
+    print(f"Loading faster-whisper model: {args.model} (cpu, compute_type={args.compute_type}) ...")
     model = WhisperModel(args.model, device="cpu", compute_type=args.compute_type)
+    recorder = Recorder(
+        samplerate=args.samplerate,
+        channels=args.channels,
+        device=args.device,
+    )
 
-    # Record + transcribe in a loop
-    print("\nTip: use --model tiny (fastest) or --model base for a bit more accuracy.")
-    while True:
+    quit_flag = threading.Event()
+    busy_flag = threading.Event()  # prevents spam keys during transcribe/post
+
+    def print_help():
+        print("\nControls:")
+        print("  Q      → start/stop recording and transcribe+send to Discord")
+        print("  CTRL+C → force quit\n")
+
+    print_help()
+
+    def on_press(key):
+        # ignore if we're busy transcribing/posting
+        if busy_flag.is_set():
+            return
+
         try:
-            record_audio(
-                outfile=args.out,
-                samplerate=args.samplerate,
-                channels=args.channels,
-                device=args.device,
-            )
-            transcribe(model, args.out, args.language, args.beam_size)
+            # character keys
+            if hasattr(key, "char") and key.char:
+                c = key.char.lower()
 
-            print("Press ENTER to record again, or type q then ENTER to quit.")
-            ans = input().strip().lower()
-            if ans == "q":
-                break
+                if c == "q":
+                    if not recorder.is_recording.is_set():
+                        # Start recording
+                        recorder.start()
+                        print("● Recording... (press Q again to stop) 💀‼‼ ")
+                    else:
+                        # Stop, transcribe, and send
+                        busy_flag.set()
+                        print("Stopping...")
+
+                        wav = recorder.stop_and_save(args.out)
+                        if not wav:
+                            print("No audio captured.")
+                            busy_flag.clear()
+                            return
+
+                        print("Transcribing...")
+                        text = transcribe_file(model, wav, args.language, args.beam_size)
+
+                        if not text:
+                            print("No speech detected. Not sending.\n")
+                        else:
+                            print(f"\nTranscript:\n{text}\n")
+                            print("Sending to Discord...")
+                            try:
+                                post_to_discord(webhook_url, text)
+                                print("✅ Sent.\n")
+                            except Exception as e:
+                                print(f"❌ Discord send failed: {e}\n")
+
+                        busy_flag.clear()
         except Exception as e:
-            print(f"\nError: {e}\n")
-            break
+            print(f"Key handler error: {e}", file=sys.stderr)
+
+    # Start key listener
+    with keyboard.Listener(on_press=on_press) as listener:
+        while not quit_flag.is_set():
+            time.sleep(0.1)
+
+    print("Bye.")
 
 
 if __name__ == "__main__":
